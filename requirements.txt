@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pymupdf
+sentence-transformers
+supabase
+trafilatura
+youtube-transcript-api
+faster-whisper
+python-dotenv
+requests

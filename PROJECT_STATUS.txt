@@ -1,0 +1,485 @@
+CRITICAL INFORMATION PROJECT — STATUS / HANDOFF
+=================================================
+Last updated: 2026-09-29. One-command startup built and proven from cold, Notion
+review loop built and proven end to end (push -> review in Notion -> pull ->
+approve stays in Supabase, reject/needs_research removed from both).
+Progress ~90%. Next: run real sources through it, then Pipeline 2.
+
+
+1. THE GOAL
+-----------
+Build a system that extracts "critical information" from raw sources (books,
+podcasts, blogs, interviews) — not fluff, not everything that "sounds
+important," but information that is specific and actionable relative to a
+problem.
+
+Key distinction driving the whole design:
+  - Standard information = relevant context, not decisive
+  - Critical information  = directly solves the problem at hand
+  - Faulty information    = wrong or unverified, but looks legitimate
+
+Two separate modes, deliberately kept apart:
+  MODE B (what we're building right now): no target problem yet. Ingest
+    everything from books/podcasts/blogs into a knowledge base. Don't try
+    to judge "importance" at this stage — that's impossible without a
+    problem to judge against. Just atomize (break into single-idea claims)
+    and tag with metadata (source, claim type, topic, verifiability). This
+    doubles as problem-discovery research: claims tagged as "pain_point"
+    are signal for what problems actually exist in the niche (SaaS).
+
+  MODE A (future, not built yet): once a specific problem is chosen, query
+    the knowledge base (semantic search + tag filter) to pull a narrow
+    candidate set, THEN apply relevance/specificity/verifiability scoring
+    against that specific problem, then synthesize into an ordered
+    methodology. This is cheap because it's a query over pre-processed
+    data, not a re-read of every source.
+
+Niche: SaaS. Still in the research/problem-discovery phase (Mode B), not
+yet at Mode A.
+
+
+2. THE END GOAL (full automation vision)
+-----------------------------------------
+OpenCode (local, free models) acts as the AGENT. The user just chats with
+it normally ("here's a new podcast transcript, process it") and it decides
+which tool to call — no separate "agent brain" needed elsewhere.
+
+n8n acts as the TOOLBOX. One n8n workflow with one MCP Server Trigger node
+exposes multiple tool nodes (HTTP Request Tool nodes calling a local
+FastAPI server). OpenCode is configured with n8n's MCP endpoint as an MCP
+server, so it can call these tools autonomously.
+
+IMPORTANT CORRECTION mid-project: originally planned "one MCP Server
+Trigger per tool group" (5 separate triggers). This was wrong — n8n's MCP
+integration works as ONE trigger exposing MULTIPLE tools. Corrected.
+
+IMPORTANT CORRECTION #2: originally tried to build n8n tool nodes using
+the "Execute Command" node type, hand-authored as raw JSON. This was
+broken for three reasons:
+  - Wrong node type for an AI-tool connection (regular node vs tool-node)
+  - Execute Command is DISABLED BY DEFAULT in n8n since v2.0 (security),
+    not available on n8n Cloud at all
+  - Hand-authoring exact n8n node type/typeVersion strings blind is
+    unreliable — n8n's node schemas vary by version and aren't fully
+    documented/stable enough to guess correctly from outside the app
+
+CURRENT PLAN (not yet executed): abandon Execute Command entirely. Wrap
+every Python script behind one local FastAPI server (toolbox_api.py,
+already built — see below). Every n8n tool node becomes an HTTP Request
+Tool hitting an endpoint on that local server (http://localhost:8000/...).
+This means only ONE node type needs to work correctly in n8n, not several.
+Build the FIRST one manually in n8n's UI (drag from the Tools connector's
+search panel on the MCP Server Trigger — this guarantees n8n picks the
+correct type/version for the installed version, no more guessing), get it
+working end to end, then duplicate it 5 more times and just swap the URL
++ body fields for the other endpoints.
+  [2026-09-27: SUPERSEDED — imported n8n_critical_info_toolbox.json instead
+  (correct types: mcpTrigger v1.1 + httpRequestTool v4.2). See section 4.]
+
+
+3. ARCHITECTURE OVERVIEW
+--------------------------
+Pipeline 1 (ingestion — THIS IS WHAT WE'VE BEEN BUILDING):
+  Raw sources -> Conversion (PDF/audio/web -> text) -> Atomization
+  (break into atomic claims, no judgment) -> Tagging (claim type, topic,
+  verifiability) -> Storage (Supabase, with dedup/corroboration counting)
+
+Pipeline 2 (retrieval/synthesis — NOT STARTED YET):
+  Knowledge base -> Define problem -> Retrieve (semantic + tag filter) ->
+  Problem-relative filter (relevance/specificity/verifiability scoring) ->
+  Synthesis (ordered methodology)
+
+Tool stack locked in:
+  - PDF extraction: PyMuPDF
+  - Audio/video: youtube-transcript-api (captions) -> faster-whisper (fallback)
+  - Web scraping: Trafilatura
+  - Atomize/tag: OpenCode (local models — Muse Spark for atomize, Nemotron
+    for tag/score, since tagging needs more judgment)
+  - Dedup: sentence-transformers embeddings + cosine similarity via
+    Supabase pgvector
+  - Storage: Supabase (Postgres + pgvector), project named "Critical
+    Information"
+  - Review checkpoint: Notion (human review of tagged claims before trust).
+    Model settled 2026-09-29: Notion is the REVIEW INBOX, Supabase is the
+    TRUSTED STORE.
+      Notion  : holds only rows still awaiting a decision. Approved/rejected
+                rows are removed once handled, so the inbox stays short.
+      Supabase: holds only approved claims. rejected / needs_research are
+                deleted. pending claims remain in both until decided.
+    Access is via the Notion REST API directly (not the Notion MCP server) --
+    this is a fixed bulk push/pull, not conversational work, so a deterministic
+    script beats an improvising tool. The notion MCP entry stays in the global
+    opencode config for the user's other project.
+  - Orchestration glue: local FastAPI server (toolbox_api.py) wrapping all
+    the Python scripts as HTTP endpoints
+  - Agent/automation layer: OpenCode + n8n via MCP (see section 2)
+
+
+4. WHAT WE HAVE DONE (confirmed working)
+-------------------------------------------
+- Supabase project "Critical Information" created.
+- `claims` table schema created and RUN successfully (supabase_schema.sql).
+  Manually tested by inserting one row by hand — confirmed visible in the
+  Table Editor.
+- toolbox_api.py (FastAPI app) built. Endpoints: /extract_pdf, /transcribe,
+  /scrape_web, /atomize_and_tag, /store_claim. Run with:
+      uvicorn toolbox_api:app --port 8000
+  Bugs found and fixed along the way:
+    - SCRIPTS_DIR originally used "~/..." which does NOT expand on Windows
+      inside a Python string (only works in Unix shells). Fixed to use
+      Path(__file__).parent / "scripts" — resolves correctly regardless of
+      OS or where uvicorn is launched from.
+    - Hardcoded "python3" doesn't exist on this Windows machine. Fixed to
+      use sys.executable instead (always points to whichever Python is
+      actually running the API).
+    - Added python-dotenv + load_dotenv() so Supabase credentials load
+      automatically from a .env file instead of needing to be set as
+      shell environment variables every session.
+- extract_pdf.py — CONFIRMED WORKING end to end. Tested via
+  localhost:8000/docs (Swagger UI) against a real PDF ("Predictable
+  Revenue" by Aaron Ross). Returns clean text with "--- page N ---"
+  markers. Fixed a bug where the deprecated `fitz` import name printed a
+  warning line straight into stdout, contaminating the extracted text —
+  fixed by importing as `pymupdf as fitz` instead.
+- requirements.txt created: fastapi, uvicorn, pymupdf, sentence-
+  transformers, supabase, trafilatura, youtube-transcript-api,
+  faster-whisper, python-dotenv.
+- supabase_match_function.sql written (a Postgres function `match_claims`
+  using pgvector cosine similarity, used by store_claim.py to detect
+  near-duplicate claims before inserting). *** NEEDS CONFIRMATION: verify
+  this was actually run in the Supabase SQL Editor — not confirmed in
+  conversation. ***
+- atomize_and_tag.py written. Several real bugs found and fixed:
+    - Windows couldn't find "opencode" via subprocess (it's an npm .cmd/
+      .ps1 wrapper, not a raw .exe — Windows' CreateProcess doesn't
+      resolve that the way a real shell does). Fixed with shell=(os.name
+      == "nt") on the subprocess.run call.
+    - Confirmed real model ID for atomization:
+      opencode/muse-spark-1.3-contributor-free
+    - Discovered that plain `opencode run` (no flags) does NOT produce
+      clean output on stdout when piped/captured — the actual reply text
+      gets mixed into stderr/human-formatted console output. Fixed by
+      switching to `opencode run --format json`, which outputs one JSON
+      event per line (NDJSON). The model's real reply lives inside
+      "type":"text" events, in event.part.text. Rewrote call_opencode()
+      to parse this event stream and stitch together all text events in
+      order. THIS FIX WAS JUST APPLIED — NOT YET RE-TESTED (see bugs list).
+- store_claim.py written: embeds a claim with sentence-transformers,
+  checks Supabase's match_claims RPC for a near-duplicate, either bumps
+  corroboration_count on the existing row or inserts a new one.
+  *** NOT YET TESTED AT ALL. ***
+- transcribe.py written: tries YouTube captions first (fast, free), falls
+  back to faster-whisper for local files. *** NOT YET TESTED. ***
+- scrape_web.py written: Trafilatura-based clean article extraction from
+  a URL. *** NOT YET TESTED. ***
+- .env / .env.template set up for SUPABASE_URL and SUPABASE_KEY (use the
+  service_role key, not anon — this pipeline writes to the table).
+- [2026-09-27] atomize_and_tag.py CONFIRMED WORKING end to end via
+  /atomize_and_tag (5 tagged claims, returncode 0). Root cause of the
+  earlier empty-output failure: shell=True through npm's .cmd wrapper
+  mangles multi-line prompts (model saw 'No text was included'). Fixed by
+  calling node_modules/opencode-ai/bin/opencode.exe directly with
+  shell=False (find_opencode_bin() in the script).
+- [2026-09-27] TAG_MODEL confirmed valid: opencode/nemotron-3-ultra-free
+  exists in `opencode models` output.
+- [2026-09-27] store_claim.py CONFIRMED WORKING: same claim submitted 3x
+  -> 1 row, corroboration_count 3, similarity 1.00 dedup hits.
+  match_claims RPC CONFIRMED live in Supabase. First run is slow (~2 min,
+  downloads all-MiniLM-L6-v2) — expected.
+- [2026-09-27] scrape_web.py CONFIRMED WORKING after UTF-8 stdout fix
+  (Windows cp1252 crashed on chars like ↑). Wikipedia SaaS (3,646 words)
+  + Paul Graham essay (7,144 words) both extract cleanly.
+- [2026-09-27] transcribe.py YouTube path CONFIRMED WORKING after fixing
+  v1.x API (get_transcript removed -> YouTubeTranscriptApi().fetch()
+  with .text snippets). Local faster-whisper fallback ARCHIVED per user
+  (YouTube-only workflow, no downloads): transcribe_file() now raises
+  NotImplementedError.
+- [2026-09-27] n8n side BUILT and LIVE: n8n_critical_info_toolbox.json
+  (MCP Server Trigger v1.1 + 5x httpRequestTool v4.2, $fromAI args,
+  toolDescriptions, host.docker.internal URLs). Lesson: tools must be
+  n8n-nodes-base.httpRequestTool — regular httpRequest loses its wires on
+  import. tools/list returns all 5; end-to-end MCP scrape_web call works.
+  Runtime: uvicorn MUST use --host 0.0.0.0 for Docker; ngrok reserved
+  domain half-unless-donor.ngrok-free.dev forwards to n8n; workflow Active.
+- [2026-09-27] OpenCode MCP client WIRED + PROVEN: global
+  C:\Users\Rifat\.config\opencode\opencode.jsonc has the
+  critical-info-toolbox remote entry; `opencode mcp list` shows connected;
+  a live agent run autonomously called critical-info-toolbox_scrape_web.
+
+- [2026-09-29] ONE-COMMAND STARTUP BUILT AND PROVEN. start.ps1 does all 5
+  steps unattended: (1) launches Docker Desktop if the engine is down and
+  waits for it, (2) starts the n8n project containers and waits for HTTP on
+  :5678, (3) starts uvicorn toolbox_api on :8000, (4) starts ngrok and
+  confirms the tunnel is live, (5) activates the "Critical Info Toolbox (MCP)"
+  workflow via the n8n public REST API — no UI clicking. stop.ps1 tears it all
+  back down; start.ps1 -Status reports state without changing anything.
+  User's n8n API key + Notion token now live in .env.
+  Bugs found and fixed while building it:
+    - First draft failed to PARSE: nested quoting inside Start-Process
+      -Command strings, plus em-dashes/other non-ASCII in the file (Windows
+      PowerShell 5.1 reads .ps1 as ANSI, not UTF-8). Rewritten ASCII-only with
+      a Launch-Window helper that single-quotes the path.
+    - Container names are PREFIXED with the compose project name, so the
+      expected "n8n-1" does not exist — it is "n8n-n8n-1". Now detected by
+      asking Docker which container publishes :5678.
+    - stop.ps1 stopped all 5 n8n-project containers but start.ps1 only
+      restarted one. Both now walk the full list.
+    - ngrok tunnel check compared the wrong field (tunnel "name" is
+      "command_line" for named tunnels) and reported a false failure while the
+      tunnel was actually live. Now compares public_url.
+    - $pid is a RESERVED PowerShell variable -- assigning to it in a test
+      command failed. Use $page.
+  Verified by full cold start (stop everything -> run start.ps1) followed by
+  `opencode mcp list` showing critical-info-toolbox connected.
+
+- [2026-09-29] SLASH COMMANDS BUILT, PROJECT-SCOPED. In
+  .opencode/command/ (Critical Information folder only — deliberately NOT
+  global): start.md, stop.md, status.md, process.md, review.md, review-pull.md.
+  /process <url|path> is the one-command ingest: it checks the stack, picks
+  extract/transcribe/scrape by content type, atomizes + tags, stores every
+  claim, and reports new-vs-corroborated counts.
+
+- [2026-09-29] NOTION REVIEW LOOP BUILT AND PROVEN END TO END.
+    - notion_setup.py creates the "Critical Info - Claim Review" database under
+      a parent page shared with the integration. Properties mirror the tagging
+      taxonomy exactly: Claim, Status, Claim Type, Verifiability, Topic Tags,
+      Source, Author, Source Type, Source Location, Corroborations, Notes,
+      Supabase ID. Database id 3ead4864-1835-815b-a015-f2ea32ed2ab0.
+    - notion_sync.py pushes Supabase claims into Notion as Status=pending.
+      IDEMPOTENT: matches on the "Supabase ID" property, so re-running updates
+      rather than duplicating. Verified (1 claim pushed, re-run skipped it).
+    - notion_pull.py applies verdicts and moves the trust boundary:
+        approved       -> Supabase reviewed=true + notes, Notion row removed
+        rejected       -> deleted from Supabase, Notion row removed
+        needs_research -> deleted from Supabase, Notion row removed
+        pending        -> left alone in both
+      --archive moves excluded claims to a claims_rejected table instead of
+      deleting them; --archive-create prints that table's DDL.
+      --dry-run previews everything.
+    - The user does NOT have to tell the agent review is done, and the agent
+      never waits mid-run on the user. Running /review-pull is the signal.
+    - TESTED with 3 throwaway claims (approved / rejected / pending): all
+      three landed correctly in both stores. Test rows then deleted; Supabase
+      back to 1 real claim, approved.
+    - Test helpers make_test_claims.py / make_test_verdicts.py were used and
+      then DELETED. Do not recreate unless re-testing the round trip.
+
+- [2026-09-29] Supabase `notes` column added (user ran the DDL in the SQL
+  Editor). idea `notes` now records the pulled-back review verdict, e.g.
+  "review: approved | <user note>". The script still degrades gracefully if
+  the column is ever missing.
+
+
+5. WHAT IS STILL LEFT
+------------------------
+Immediate / next:
+- RUN REAL SOURCES THROUGH IT. Everything is proven on test data only. The
+  first real /process run on a real book/podcast/blog has not happened, and
+  volume behaviour is unknown: claim counts per source, whether the dedup
+  threshold (0.85) actually holds up, and whether atomize_and_tag's JSON
+  parsing survives real model output at volume (see bug 5).
+- Notion review views (Pending queue / Needs research / Approved / Rejected)
+  were attempted via the API and SILENTLY DID NOT PERSIST — Notion accepted
+  the request without saving. Not worth fighting; add them by hand in Notion
+  (filter Status = pending, group by Source) if the inbox gets long.
+  script notion_views.py was deleted since it does not actually work.
+- Choose whether unapproved claims should live in Supabase at all. Right now
+  ingestion pushes to Supabase FIRST (needed for dedup, which is
+  vector-similarity against the shared store), so rejected claims sit in
+  Supabase between /review and /review-pull. They are cleaned up on pull.
+  User was shown this tradeoff and accepted it for now.
+
+Bigger remaining work:
+- Pipeline 2 (retrieval/synthesis against a specific chosen problem): not
+  designed in detail beyond the high-level architecture in section 3. A
+  specific problem in the SaaS niche has not been chosen yet — that choice
+  gates Pipeline 2 entirely. Do not start before enough real claims exist in
+  Supabase to be worth querying.
+- Mode A vs Mode B: still in Mode B (ingest + tag everything, don't judge
+  importance). Switching to Mode A requires picking one problem first.
+
+Minor / cosmetic:
+- Mojibake on non-ASCII chars through the MCP path (sæs -> sÃ¦s). Direct
+  script output is clean, so it is in the n8n/FastAPI transport, not the
+  extractor. Unfixed.
+- supabase_schema.sql / supabase_match_function.sql are still NOT in the
+  project folder. The DB is fine (table, pgvector, match_claims RPC all
+  confirmed live) — re-export for backup when convenient.
+- scripts/toolbox_api.py is a stale misnamed copy of an old atomize script —
+  ignore or delete it; the real API is the root toolbox_api.py.
+- No virtual environment. Everything is installed in global/system Python
+  (3.12.10). User chose to skip it for now.
+- The `notion` MCP server in the global opencode.jsonc still shows
+  "needs authentication". Harmless — this project uses the REST API — but
+  could be removed for cleanliness.
+
+
+6. KNOWN BUGS / UNRESOLVED ISSUES
+------------------------------------
+- Pipeline 1 (ingestion) is FULLY PROVEN as of 2026-09-27 — every active
+  endpoint tested individually plus one full MCP round-trip.
+- Notion review step: set up a real Notion integration (token + database
+  ID) for the human checkpoint before claims are trusted. OpenCode already
+  has a notion MCP server configured (see opencode.jsonc) — reuse it.
+- Pipeline 2 (retrieval/synthesis against a specific chosen problem): not
+  designed in detail beyond the high-level architecture in section 3.
+  Future phase.
+- Minor cosmetic bug (2026-09-27): accented chars come back mojibake'd
+  through the MCP path (sæs -> sÃ¦s). Direct script output is clean, so
+  it's in the n8n/FastAPI transport, not the extractor. Fix later.
+- Housekeeping: supabase_schema.sql / supabase_match_function.sql are NOT
+  in the project folder (DB side is fine — table + RPC confirmed live —
+  but re-export them for backup when convenient). scripts/toolbox_api.py
+  is a stale misnamed copy of an old atomize script — ignore or delete it;
+  the real API is the root toolbox_api.py.
+- Once Pipeline 1 (ingestion) is fully proven end to end, Pipeline 2
+  (retrieval/synthesis against a specific chosen problem) hasn't been
+  designed in detail yet beyond the high-level architecture in section 3.
+  That's a future phase — don't start it before Pipeline 1 works.
+- Decide whether to set up a virtual environment. Currently everything is
+  installed in the global/system Python (see bug #6 below for a related
+  concern). User was informed and chose to skip it for now.
+
+
+6. KNOWN BUGS / UNRESOLVED ISSUES
+------------------------------------
+1. atomize_and_tag.py's --format json rewrite was just applied in this
+   conversation and has NOT been confirmed working yet by an actual retest.
+2. TAG_MODEL in atomize_and_tag.py is still an unconfirmed placeholder
+   ("opencode/nemotron-3-ultra-free") — likely wrong, needs verification.
+3. store_claim.py, transcribe.py, scrape_web.py have never been tested —
+   treat as "probably has bugs, not yet discovered" rather than "working."
+4. Multiple different Python installations have appeared across error
+   tracebacks over the course of this conversation: one referencing
+   "pythoncore-3.14-64" and another referencing "Python312". This was
+   never fully resolved — worth checking `where python` / `python
+   --version` in whatever terminal is used to run uvicorn, and confirming
+   pip installs and the running server are using the SAME Python
+   installation. Could silently cause "package not found" errors if they
+   drift apart.
+5. atomize_and_tag.py's prompts instruct the model to output ONLY raw
+   JSON, no markdown fences. parse_json_loose() attempts to strip fences
+   if present as a safety net, but this hasn't been stress-tested against
+   real model output quirks at volume — watch for parse failures here as
+   more sources get processed.
+6. The --format json event-parsing in call_opencode() currently
+   concatenates ALL "type":"text" events under the assumption they're all
+   part of the one main reply. If a model uses any internal tool calls
+   (e.g. web search) that produce non-"text" event types interleaved with
+   the reply, or if a reply gets fragmented in an unexpected way, this
+   parsing may need to get smarter. Not an observed problem yet — a
+   watch item.
+7. store_claim.py loads the sentence-transformers model fresh on every
+   single CLI invocation (no caching between calls) — slow and wasteful
+   at volume. Known future optimization, not urgent at current low volume.
+8. The dedup similarity threshold (0.85 cosine similarity, in both
+   supabase_match_function.sql and store_claim.py) is a reasonable
+   starting guess, not empirically tuned. May need adjusting once real
+   claims start flowing through and duplicates are checked by hand.
+9. n8n side is completely unbuilt. The one hand-authored JSON attempt
+   earlier in the project (using Execute Command nodes) was fundamentally
+   broken for the reasons in section 2 — do not reuse or reference that
+   file, it was abandoned.
+   [2026-09-27: RESOLVED — n8n_critical_info_toolbox.json built, imported,
+   live. Related NEW lesson: n8n import silently drops ai_tool wires from
+   regular n8n-nodes-base.httpRequest nodes — tools MUST be
+   n8n-nodes-base.httpRequestTool.]
+10. [2026-09-27] Earlier items #1, #2 (atomize --format json + TAG_MODEL),
+    #3 (store/transcribe/scrape untested), and the match_claims
+    confirmation are all RESOLVED this session (see section 4). #4
+    (multiple Pythons) still open but no drift observed today — pip and
+    the running server both use Python 3.12.10.
+11. [2026-09-27, minor] Mojibake on non-ASCII chars through the MCP path
+    (see section 5). Transport issue, not extractor.
+12. [2026-09-29] Notion database VIEWS do not persist via the API. The request
+    is accepted (HTTP 200) but the views are not saved — `views` came back
+    empty on re-read. Notion's database-view API appears to be no-op for
+    non-OAuth integrations. Workaround is manual filtering in the Notion UI.
+    Do not spend more time automating this.
+13. [2026-09-29] notion_pull.py DELETES rejected / needs_research claims from
+    Supabase by design. If a user ever wants those back, they must have run
+    --archive (which requires the claims_rejected table, created via
+    --archive-create). Plain pulls are not reversible. Flag this to the user
+    before running a plain pull if they sound unsure.
+14. [2026-09-29, untested] The whole review loop has only been exercised on
+    throwaway test data (3 claims) plus one manually-inserted test claim. It
+    has never run against real atomized output. First real run may surface
+    issues with real claim lengths (Notion title properties cap at 2000 chars
+    — build_row truncates to 1900), unusual tag values, or many-claim volume.
+15. [2026-09-29, FIXED] notion_pull.py used to ABORT on an orphaned Notion row
+    (one whose Supabase claim was already deleted) and leave it in place —
+    so a single stale row permanently failed every subsequent pull. Now
+    orphaned rows are detected and cleared from the Notion inbox, reported
+    as "orphaned". Caught by a real dry run, not a test.
+16. [2026-09-29, FIXED] notion_sync.py pushed ALL Supabase claims, so an
+    APPROVED claim bounced straight back into the Notion inbox on the next
+    /review — undoing the cleanup the user asked for. Now filters
+    reviewed=eq.false by default; --include-reviewed overrides. Caught the
+    same way, on the very first real sync after testing.
+
+
+7. FILE INVENTORY (as of this handoff)
+------------------------------------------
+Expected local folder structure — "Critical Information" folder:
+
+  Critical Information/
+  |-- start.ps1                   (ONE-COMMAND START — everything, unattended)
+  |-- stop.ps1                    (tear the stack back down)
+  |-- toolbox_api.py              (FastAPI app -- run with uvicorn)
+  |-- .env                        (Supabase + Notion + n8n creds -- keep private)
+  |-- requirements.txt
+  |-- n8n_critical_info_toolbox.json  (importable n8n workflow)
+  |-- PROJECT_STATUS.txt          (this file)
+  |-- .opencode/command/          (project-scoped slash commands, see below)
+  |   |-- start.md    /stop.md    /status.md
+  |   |-- process.md              (/process <url|path> = full ingest)
+  |   `-- review.md  /review-pull.md
+  `-- scripts/
+      |-- extract_pdf.py          (CONFIRMED WORKING)
+      |-- atomize_and_tag.py      (CONFIRMED WORKING)
+      |-- store_claim.py          (CONFIRMED WORKING, dedup verified)
+      |-- transcribe.py           (CONFIRMED WORKING, YouTube path)
+      |-- scrape_web.py           (CONFIRMED WORKING)
+      |-- toolbox_api.py          (STALE misnamed copy — ignore/delete)
+      |-- notion_setup.py         (creates the review database)
+      |-- notion_sync.py          (Supabase -> Notion, idempotent)
+      `-- notion_pull.py          (Notion verdicts -> Supabase, moves boundary)
+
+Supabase: project "Critical Information", `claims` table live with pgvector
+enabled, `match_claims` RPC CONFIRMED live, `notes` column added 2026-09-29.
+NOT in the project folder: supabase_schema.sql, supabase_match_function.sql
+(re-export for backup when convenient).
+Notion: database "Critical Info - Claim Review"
+  id 3ead4864-1835-815b-a015-f2ea32ed2ab0, under page 3ead48641835806db265dc8f2ab4c8dd.
+  No filtered views (API can't persist them — see bug 12).
+n8n workflow: "Critical Info Toolbox (MCP)" id UyBdrlVE2KsPJpiM.
+OpenCode client config (global): C:\Users\Rifat\.config\opencode\
+opencode.jsonc includes the critical-info-toolbox remote entry + an unused
+`notion` MCP entry (needs auth, harmless).
+Runtime: start.ps1 handles uvicorn --host 0.0.0.0 --port 8000, ngrok http
+--url=half-unless-donor.ngrok-free.dev 5678, and workflow activation.
+
+
+8. HOW TO PICK THIS BACK UP
+------------------------------
+1. Say "/start" in an opencode session opened from the Critical Information
+   folder. That is the ONLY step needed — no Docker app, no n8n UI, no manual
+   activation. It takes 1-3 min cold. "/status" checks, "/stop" tears down.
+   Equivalent by hand:
+     powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
+2. Health check: `opencode mcp list` should show critical-info-toolbox
+   connected. tools/list should return 5 tools:
+     npx @modelcontextprotocol/inspector --cli --server-url <prod-url>
+     --method tools/list --format json
+3. THE NORMAL LOOP, end to end:
+     /process <url|path>   extract -> atomize+tag -> store in Supabase
+     /review              push new claims to Notion as pending
+     [user reviews in Notion, sets Status per row]
+     /review-pull         approved -> stays in Supabase; rejected and
+                          needs_research -> deleted from Supabase; handled
+                          rows cleared from Notion. Use --dry-run first if
+                          unsure. The agent never waits on the user.
+4. Next real work: run actual sources through it. Then pick ONE specific SaaS
+   problem — that choice gates Pipeline 2 entirely. Do not start Pipeline 2
+   before enough real claims exist in Supabase to be worth querying.
+
