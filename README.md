@@ -55,12 +55,12 @@ copy .env.example .env    # then fill in your keys
 ./start.ps1               # Windows: starts the local API server
 ```
 
-You need a `.env` with:
-- `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` — where claims are stored
-- `NOTION_TOKEN` — the review inbox
-- `N8N_API_KEY` — optional, only if you wire it to n8n
+`.env` needs:
+- `SUPABASE_URL` + `SUPABASE_KEY` — where claims are stored
+- `NOTION_API_KEY` + `NOTION_DATABASE_ID` — the review inbox
 
-See `.env.example` for the full list.
+`NOTION_PARENT_PAGE_ID` is optional and only used by `notion_setup.py`. See
+`.env.example`.
 
 ---
 
@@ -89,7 +89,5 @@ See `.env.example` for the full list.
   generated, not source.
 - `.env` is gitignored. Never commit keys.
 
----
-
-Built as part of learning to separate **standard information** (context) from
-**critical information** (actually solves your problem).
+Built to support niche research: separate **standard information** (context) from
+**critical information** (actually solves the problem at hand).
